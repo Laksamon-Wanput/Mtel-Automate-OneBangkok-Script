@@ -1,22 +1,22 @@
 # OneBangkok Script
 
-สคริปต์นี้ใช้ค้นหา Notification ของ account จากอีเมล โดยทำงานตามลำดับดังนี้:
+This script checks whether an account has received a notification containing a specified message. It follows these steps:
 
-1. ค้นหา `account_id` จากฐาน `ob_iam_uat`
-2. ค้นหา `recipient_id` จากฐาน `ob_notification_uat`
-3. ค้นหา message ที่มีข้อความตามค่า `NOTIFICATION_MESSAGE` ใน `.env`
+1. Find the `account_id` for an email address in `ob_iam_uat`.
+2. Find the `recipient_id` for that account in `ob_notification_uat`.
+3. Count matching notifications using `NOTIFICATION_MESSAGE` from `.env`.
 
-## การติดตั้ง
+## Requirements
 
-ต้องมี Python 3 และเชื่อมต่อ network/VPN ที่เข้าถึงฐาน UAT ได้ จากนั้นติดตั้ง package:
+Install Python 3 and connect to the network or VPN that can access the UAT databases. Then install the PostgreSQL driver:
 
 ```bash
 python3 -m pip install 'psycopg[binary]>=3.2,<4'
 ```
 
-## การตั้งค่า
+## Configuration
 
-วางไฟล์ `.env` ที่ root ของโปรเจกต์ โดยต้องมีตัวแปรต่อไปนี้:
+Place a `.env` file in the project root with these values:
 
 ```env
 IAM_DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/ob_iam_uat"
@@ -24,23 +24,23 @@ Notification_DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/ob_notification_
 NOTIFICATION_MESSAGE="Check your coupon details for eligible items"
 ```
 
-> ห้าม commit หรือ push ไฟล์ `.env` ที่มี username/password จริงขึ้น GitHub
+Replace the database placeholders with your UAT connection details. Keep `.env` private; it may contain a database password.
 
-## วิธี Run
+## Run the script
 
-เข้าไปที่ root ของโปรเจกต์:
+Open a terminal in the project root. For this checkout:
 
 ```bash
 cd "/Users/wanputlaksamon/Projects/OneBangkok-Script"
 ```
 
-รันโดยระบุอีเมลที่ต้องการค้นหา:
+Search for an email address:
 
 ```bash
 python3 'Shuttlebus/Find notification from email&message' --email 'wanput.lak+4@mtel.co.th'
 ```
 
-แสดง `message.data` ของแต่ละ row ที่พบ:
+To print the `message.data` value for each matching row, add `--show-data`:
 
 ```bash
 python3 'Shuttlebus/Find notification from email&message' \
@@ -48,32 +48,28 @@ python3 'Shuttlebus/Find notification from email&message' \
   --show-data
 ```
 
-ค้นหาข้อความอื่นชั่วคราว โดยไม่ต้องแก้ `.env`:
+To search for a different message without changing `.env`, use `--message`:
 
 ```bash
 python3 'Shuttlebus/Find notification from email&message' \
   --email 'wanput.lak+4@mtel.co.th' \
-  --message 'ข้อความที่ต้องการค้นหา'
+  --message 'Another notification message'
 ```
 
-ดูตัวเลือกทั้งหมด:
+To see all options:
 
 ```bash
 python3 'Shuttlebus/Find notification from email&message' --help
 ```
 
-## ผลลัพธ์
+## Results
 
-เมื่อพบข้อมูล สคริปต์จะแสดง `account_id`, `recipient_id`, message ID และจำนวน row:
+The script logs the account and recipient lookup results, then prints the number of matching message rows. A successful result looks like this:
 
 ```text
 FOUND: พบข้อมูลทั้งหมด 2 row(s)
 ```
 
-เมื่อไม่พบข้อมูล สคริปต์จะแสดง error และคืน exit code `1`:
+The script currently prints some status and error messages in Thai. If no matching message is found, it prints an `ERROR` and exits with code `1`.
 
-```text
-ERROR: ไม่พบ message ที่มีข้อความ "..." สำหรับ email ...
-```
-
-หาก Terminal ค้างที่ `dquote>` ให้กด `Ctrl+C` แล้วรันคำสั่งใหม่ โดยตรวจว่าเครื่องหมาย quote `'` หรือ `"` ปิดครบคู่
+If your terminal shows `dquote>`, press `Ctrl+C` and rerun the command. This prompt means a double quote (`"`) was left open.
