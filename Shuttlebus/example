@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Find notification messages for an identity across the IAM and notification DBs."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, NoReturn
+
+try:
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import dict_row
+except ImportError:
+    print(
+        "ERROR: ไม่พบ package 'psycopg' กรุณารัน: "
+        "python3 -m pip install 'psycopg[binary]'",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+DEFAULT_MESSAGE = "Check your coupon details for eligible items"
+
+
+def fail(message: str, exit_code: int = 1) -> NoReturn:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    """Load a small .env file without adding another package dependency."""
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            fail(f"รูปแบบ .env ไม่ถูกต้องที่บรรทัด {line_number}", 2)
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description=(
+            "ค้นหา account_id จาก IAM แล้วใช้ recipient_id ค้นหา notification message"
+        ),
+        epilog=(
+            "ตัวอย่าง: python3 example --email wanput.lak@mtel.co.th --show-data"
+        ),
+    )
+    result.add_argument(
+        "--email",
+        help="อีเมลของ account ที่ต้องการค้นหา เช่น wanput.lak@mtel.co.th",
+    )
+    result.add_argument(
+        "--setup-credential",
+        action="store_true",
+        help="บันทึก Database password ลง ~/.pgpass เพียงครั้งเดียว",
+    )
+    result.add_argument(
+        "--message",
+        help="ข้อความที่ต้องการค้นหา (ถ้าไม่ระบุจะใช้ NOTIFICATION_MESSAGE จาก .env)",
+    )
+    result.add_argument("--db-host", default="10.143.119.67")
+    result.add_argument("--db-port", default="5432")
+    result.add_argument("--db-user", default="postgres")
+    result.add_argument("--iam-database", default="ob_iam_uat")
+    result.add_argument("--notification-database", default="ob_notification_uat")
+    result.add_argument("--iam-schema", default="public")
+    result.add_argument("--notification-schema", default="public")
+    result.add_argument("--identity-table", default="identity")
+    result.add_argument("--recipient-table", default="recipient")
+    result.add_argument("--message-table", default="message")
+    result.add_argument(
+        "--show-data",
+        action="store_true",
+        help="แสดงค่า message.data ของแต่ละแถวที่พบ",
+    )
+    return result
+
+
+def find_account_ids(
+    connection: psycopg.Connection[Any], schema: str, table: str, identifier: str
+) -> list[str]:
+    # This reproduces the UI's "Any column = ..." search without knowing which
+    # identity column stores email, while still requiring an exact value match.
+    query = sql.SQL(
+        """
+        SELECT DISTINCT src.account_id::text AS account_id
+        FROM {}.{} AS src
+        WHERE EXISTS (
+            SELECT 1
+            FROM jsonb_each_text(to_jsonb(src)) AS field(key, value)
+            WHERE field.value = %s
+        )
+        """
+    ).format(sql.Identifier(schema), sql.Identifier(table))
+    with connection.cursor() as cursor:
+        cursor.execute(query, (identifier,))
+        return [row["account_id"] for row in cursor.fetchall() if row["account_id"]]
+
+
+def find_recipient_ids(
+    connection: psycopg.Connection[Any], schema: str, table: str, account_ids: list[str]
+) -> list[str]:
+    # The manual flow also searches "Any column" for the account UUID.
+    query = sql.SQL(
+        """
+        SELECT DISTINCT src.id::text AS recipient_id
+        FROM {}.{} AS src
+        WHERE src.account_id = ANY(%s::varchar[])
+           OR EXISTS (
+            SELECT 1
+            FROM jsonb_each_text(to_jsonb(src)) AS field(key, value)
+            WHERE field.value = ANY(%s::text[])
+        )
+        """
+    ).format(sql.Identifier(schema), sql.Identifier(table))
+    with connection.cursor() as cursor:
+        cursor.execute(query, (account_ids, account_ids))
+        return [row["recipient_id"] for row in cursor.fetchall() if row["recipient_id"]]
+
+
+def find_messages(
+    connection: psycopg.Connection[Any],
+    schema: str,
+    table: str,
+    recipient_ids: list[str],
+    message: str,
+) -> list[dict[str, Any]]:
+    query = sql.SQL(
+        """
+        SELECT src.*
+        FROM {}.{} AS src
+        WHERE src.recipient_id = ANY(%s::varchar[])
+          AND src.data::text ILIKE '%%' || %s || '%%'
+        ORDER BY src.id
+        """
+    ).format(sql.Identifier(schema), sql.Identifier(table))
+    with connection.cursor() as cursor:
+        cursor.execute(query, (recipient_ids, message))
+        return list(cursor.fetchall())
+
+
+def printable(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def setup_credential(args: argparse.Namespace) -> int:
+    password = getpass.getpass(
+        f"Database password from TablePlus ({args.db_user}@{args.db_host}): "
+    )
+    if not password:
+        fail("password ห้ามเป็นค่าว่าง", 2)
+
+    # libpq requires ':' and '\\' to be escaped inside a .pgpass field.
+    escaped_password = password.replace("\\", "\\\\").replace(":", "\\:")
+    pgpass = Path.home() / ".pgpass"
+    prefixes = [
+        f"{args.db_host}:{args.db_port}:{args.iam_database}:{args.db_user}:",
+        (
+            f"{args.db_host}:{args.db_port}:"
+            f"{args.notification_database}:{args.db_user}:"
+        ),
+    ]
+
+    existing_lines: list[str] = []
+    if pgpass.exists():
+        existing_lines = [
+            line
+            for line in pgpass.read_text(encoding="utf-8").splitlines()
+            if not any(line.startswith(prefix) for prefix in prefixes)
+        ]
+
+    new_lines = existing_lines + [prefix + escaped_password for prefix in prefixes]
+    temporary = pgpass.with_name(".pgpass.notification-finder.tmp")
+    temporary.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(pgpass)
+    pgpass.chmod(0o600)
+    print(f"บันทึก credential สำเร็จ: {pgpass} (permission 600)")
+    print("ครั้งต่อไปใช้ --email ได้เลย โดยไม่ต้องใส่ password")
+    return 0
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.setup_credential:
+        return setup_credential(args)
+    if not args.email:
+        fail("กรุณาระบุ --email หรือใช้ --setup-credential", 2)
+    args.email = args.email.strip()
+    if not args.email:
+        fail("--email ห้ามเป็นค่าว่าง", 2)
+
+    dotenv_path = Path(__file__).resolve().parent / ".env"
+    dotenv = load_dotenv(dotenv_path)
+    iam_url = os.getenv("IAM_DATABASE_URL") or dotenv.get("IAM_DATABASE_URL")
+    notification_url = (
+        os.getenv("NOTIFICATION_DATABASE_URL")
+        or os.getenv("Notification_DATABASE_URL")
+        or dotenv.get("NOTIFICATION_DATABASE_URL")
+        or dotenv.get("Notification_DATABASE_URL")
+    )
+    message = (
+        args.message
+        or os.getenv("NOTIFICATION_MESSAGE")
+        or dotenv.get("NOTIFICATION_MESSAGE")
+        or DEFAULT_MESSAGE
+    )
+    message = message.strip()
+    if not message:
+        fail("NOTIFICATION_MESSAGE หรือ --message ห้ามเป็นค่าว่าง", 2)
+
+    log(f"[config] .env: {'loaded' if dotenv_path.exists() else 'not found'}")
+    log(
+        "[config] IAM connection: "
+        + ("configured" if iam_url else "using PostgreSQL local credentials")
+    )
+    log(
+        "[config] Notification connection: "
+        + ("configured" if notification_url else "using PostgreSQL local credentials")
+    )
+
+    if not iam_url or not notification_url:
+        connection_options = {
+            "host": args.db_host,
+            "port": args.db_port,
+            "user": args.db_user,
+            "connect_timeout": 10,
+        }
+        if not iam_url:
+            iam_url = psycopg.conninfo.make_conninfo(
+                dbname=args.iam_database, **connection_options
+            )
+        if not notification_url:
+            notification_url = psycopg.conninfo.make_conninfo(
+                dbname=args.notification_database, **connection_options
+            )
+
+    try:
+        log(f"[1/3] Searching identity for email: {args.email}")
+        with psycopg.connect(
+            iam_url, row_factory=dict_row, connect_timeout=10
+        ) as iam_connection:
+            account_ids = find_account_ids(
+                iam_connection,
+                args.iam_schema,
+                args.identity_table,
+                args.email,
+            )
+        log(f"[1/3] Identity result: {len(account_ids)} account_id row(s)")
+        if account_ids:
+            log(f"      account_id: {', '.join(account_ids)}")
+        if not account_ids:
+            fail(f"ไม่พบ identity สำหรับ email: {args.email}")
+
+        log("[2/3] Searching recipient from account_id")
+        with psycopg.connect(
+            notification_url, row_factory=dict_row, connect_timeout=10
+        ) as notification_connection:
+            recipient_ids = find_recipient_ids(
+                notification_connection,
+                args.notification_schema,
+                args.recipient_table,
+                account_ids,
+            )
+            log(f"[2/3] Recipient result: {len(recipient_ids)} recipient row(s)")
+            if recipient_ids:
+                log(f"      recipient_id: {', '.join(recipient_ids)}")
+            if not recipient_ids:
+                fail(
+                    "ไม่พบ recipient สำหรับ account_id: " + ", ".join(account_ids)
+                )
+
+            log(f'[3/3] Searching message.data containing: "{message}"')
+            messages = find_messages(
+                notification_connection,
+                args.notification_schema,
+                args.message_table,
+                recipient_ids,
+                message,
+            )
+            log(f"[3/3] Message result: {len(messages)} row(s)")
+    except psycopg.Error as error:
+        # Do not print connection URLs because they may contain passwords.
+        if "sasl authentication failed" in str(error).lower():
+            fail(
+                "password ใน ~/.pgpass ไม่ถูกต้อง กรุณารันสคริปต์ด้วย "
+                "--setup-credential แล้วใส่ password เดียวกับ TablePlus",
+                2,
+            )
+        if "no password supplied" in str(error).lower():
+            fail(
+                "เครื่องเชื่อมต่อถึง DB ได้ แต่ยังไม่มี PostgreSQL credential "
+                "สำหรับ Python กรุณาตั้งค่า ~/.pgpass เพียงครั้งเดียว",
+                2,
+            )
+        fail(f"Database query ล้มเหลว: {error}", 2)
+
+    if not messages:
+        fail(
+            f'ไม่พบ message ที่มีข้อความ "{message}" '
+            f"สำหรับ email {args.email}"
+        )
+
+    print(f"Email         : {args.email}")
+    print(f"Account ID(s): {', '.join(account_ids)}")
+    print(f"Recipient ID(s): {', '.join(recipient_ids)}")
+    print(f"FOUND: พบข้อมูลทั้งหมด {len(messages)} row(s)")
+
+    for number, row in enumerate(messages, start=1):
+        message_id = row.get("id", "-")
+        recipient_id = row.get("recipient_id", "-")
+        print(f"[{number}] id={message_id} recipient_id={recipient_id}")
+        if args.show_data:
+            print(f"    data={printable(row.get('data'))}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
